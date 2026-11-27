@@ -1,14 +1,11 @@
 /**
  * LevelGenerator - 레벨 생성 알고리즘
- * 
- * 역방향 생성 알고리즘(Reverse Generation)을 사용하여
- * 항상 풀 수 있는 스테이지를 생성합니다.
- * DAG(유향 비순환 그래프) 구조를 유지하여 순환 참조를 방지합니다.
- * 
- * 핵심 원리:
- * - 먼저 풀어야 할 볼트(리프 노드)를 먼저 결정
- * - 나중에 풀릴 볼트는 이미 풀린 볼트에 의해서만 잠김
- * - 이렇게 하면 순환 참조 없이 항상 풀 수 있는 레벨이 생성됨
+ *
+ * 역방향 생성(Reverse Generation)으로 항상 풀 수 있는 DAG 스테이지를 만듭니다.
+ * 1) 색상은 각 색마다 3의 배수로 준비 (머지 가능 보장)
+ * 2) 풀이 순서(위상 정렬 순서)를 먼저 정한 뒤
+ * 3) 나중에 풀릴 볼트만 앞선 볼트에 의해 잠기도록 lockedBy를 할당
+ * → 순환 참조 없이, 순서만 지키면 반드시 열립니다.
  */
 
 import { BoltData, BoltColor, LevelConfig, DEFAULT_CONFIG } from './types';
@@ -21,60 +18,55 @@ export class LevelGenerator {
   }
 
   /**
-   * 레벨을 생성합니다.
-   * 1. 색상 풀 생성 (각 색상 3의 배수)
-   * 2. 풀이 순서 결정 (DAG 위상정렬 호환)
-   * 3. 역방향으로 의존성 그래프 구축
-   * 4. 보드 위치에 배치
+   * 레벨 생성
    */
   generateLevel(): BoltData[] {
     const { totalBolts, colorCount, rows, cols } = this.config;
-    
-    // 1. 색상 풀 생성 (각 색상이 3의 배수가 되도록)
-    const colors = this.generateColorPool(totalBolts, colorCount);
-    
-    // 2. 보드 위치 생성
-    const positions = this.generateBoardPositions(totalBolts, rows, cols);
-    
-    // 3. 풀이 순서 생성 (0번이 가장 먼저 풀림, totalBolts-1번이 가장 나중)
-    // 이 순서가 곧 위상정렬 순서이며, 순환 참조가 발생하지 않음
-    const solveOrder = Array.from({ length: totalBolts }, (_, i) => i);
-    
-    // 4. 볼트 생성 및 의존성 할당
+
+    // 머지(3개) 단위로 맞추기 위해 총 개수를 3의 배수로 보정
+    const boltCount = Math.max(3, Math.floor(totalBolts / 3) * 3);
+
+    // 1. 색상 풀 (색상별 정확히 3의 배수)
+    const colors = this.generateColorPool(boltCount, colorCount);
+
+    // 2. 풀이 순서: index 0이 가장 먼저 풀림
+    const solveOrder = Array.from({ length: boltCount }, (_, i) => i);
+    this.shuffle(solveOrder);
+
+    // 3. 풀이 순서 기준으로 의존성 할당 (앞선 볼트만 잠글 수 있음 → DAG)
+    const lockedByMap = new Map<number, number>();
+    for (let order = 1; order < boltCount; order++) {
+      const boltId = solveOrder[order];
+      // 후반부로 갈수록 잠금 확률을 조금 높여 체인 느낌을 줌
+      const lockChance = 0.45 + (order / boltCount) * 0.25;
+      if (Math.random() > lockChance) continue;
+
+      // 바로 앞쪽 lookback개 중에서만 잠금 → 체인이 과도하게 길어지지 않음
+      const lookback = Math.min(order, 4);
+      const lockerOrder = order - 1 - Math.floor(Math.random() * lookback);
+      lockedByMap.set(boltId, solveOrder[lockerOrder]);
+    }
+
+    // 4. 보드 좌표 배치
+    const positions = this.generateBoardPositions(boltCount, rows, cols);
+
+    // 5. BoltData 조립 (id 순서로 반환하되, 의존성은 solveOrder 기준)
     const bolts: BoltData[] = [];
-    
-    for (let i = 0; i < totalBolts; i++) {
-      const boltId = i;
-      const color = colors[i];
-      const position = positions[i];
-      
-      let lockedByBoltId = -1;
-      
-      // i > 0 인 볼트만 잠글 수 있음 (0번은 항상 처음에 풀림)
-      // i번째 볼트는 0 ~ i-1 중 하나의 볼트에 의해 잠길 수 있음
-      // 이렇게 하면 순환 참조가 절대 발생하지 않음 (DAG 보장)
-      if (i > 0 && Math.random() < 0.55) { // 55% 확률로 잠금
-        // 0 ~ i-1 중에서 랜덤 선택 (이 볼트보다 먼저 풀리는 볼트들)
-        const possibleLockers = Math.min(i, 3); // 최대 3개 이전 볼트 중에서만
-        const lockerIndex = Math.floor(Math.random() * possibleLockers);
-        lockedByBoltId = lockerIndex;
-      }
-      
+    for (let id = 0; id < boltCount; id++) {
       bolts.push({
-        id: boltId,
-        color,
-        position,
-        lockedByBoltId,
+        id,
+        color: colors[id],
+        position: positions[id],
+        lockedByBoltId: lockedByMap.get(id) ?? -1,
         isRemoved: false,
       });
     }
-    
+
     return bolts;
   }
 
   /**
-   * 색상 풀 생성
-   * 각 색상이 3의 배수 개수가 되도록 분배
+   * 색상 풀 생성 — 선택 색상마다 개수가 반드시 3의 배수가 되도록 분배
    */
   private generateColorPool(totalBolts: number, colorCount: number): BoltColor[] {
     const allColors = [
@@ -85,52 +77,59 @@ export class LevelGenerator {
       BoltColor.Purple,
       BoltColor.Orange,
     ];
-    
-    const selectedColors = allColors.slice(0, colorCount);
+
+    const selectedColors = allColors.slice(0, Math.max(1, Math.min(colorCount, allColors.length)));
+    const groupCount = totalBolts / 3; // totalBolts는 이미 3의 배수
+    const baseGroups = Math.floor(groupCount / selectedColors.length);
+    let remainder = groupCount % selectedColors.length;
+
     const pool: BoltColor[] = [];
-    
-    // 각 색상을 3개씩 묶어서 분배
-    const groupsNeeded = Math.ceil(totalBolts / (3 * colorCount));
-    
-    for (let g = 0; g < groupsNeeded; g++) {
-      for (const color of selectedColors) {
-        pool.push(color, color, color); // 3개씩 추가
+    for (const color of selectedColors) {
+      const groups = baseGroups + (remainder > 0 ? 1 : 0);
+      if (remainder > 0) remainder -= 1;
+      for (let i = 0; i < groups; i++) {
+        pool.push(color, color, color);
       }
     }
-    
-    // 필요한 수만큼 자르고 셔플
-    const result = pool.slice(0, totalBolts);
-    this.shuffle(result);
-    
-    return result;
+
+    this.shuffle(pool);
+    return pool;
   }
 
   /**
-   * 보드 위치 생성 (그리드 기반 + 약간의 랜덤성)
+   * 보드 위치 생성 (그리드 + 약간의 랜덤 오프셋)
    */
-  private generateBoardPositions(totalBolts: number, rows: number, cols: number): [number, number, number][] {
+  private generateBoardPositions(
+    totalBolts: number,
+    rows: number,
+    cols: number
+  ): [number, number, number][] {
     const positions: [number, number, number][] = [];
     const { boltSpacing } = this.config;
-    
-    const offsetX = -(cols - 1) * boltSpacing / 2;
-    const offsetZ = -(rows - 1) * boltSpacing / 2;
-    
+
+    // 볼트 수에 맞게 그리드 크기 보정
+    const neededCells = totalBolts;
+    const gridCols = Math.max(cols, Math.ceil(Math.sqrt(neededCells)));
+    const gridRows = Math.max(rows, Math.ceil(neededCells / gridCols));
+
+    const offsetX = -((gridCols - 1) * boltSpacing) / 2;
+    const offsetZ = -((gridRows - 1) * boltSpacing) / 2;
+
     let count = 0;
-    for (let row = 0; row < rows && count < totalBolts; row++) {
-      for (let col = 0; col < cols && count < totalBolts; col++) {
-        const x = offsetX + col * boltSpacing + (Math.random() - 0.5) * 0.3;
-        const z = offsetZ + row * boltSpacing + (Math.random() - 0.5) * 0.3;
-        const y = 0;
-        positions.push([x, y, z]);
+    for (let row = 0; row < gridRows && count < totalBolts; row++) {
+      for (let col = 0; col < gridCols && count < totalBolts; col++) {
+        const x = offsetX + col * boltSpacing + (Math.random() - 0.5) * 0.25;
+        const z = offsetZ + row * boltSpacing + (Math.random() - 0.5) * 0.25;
+        positions.push([x, 0, z]);
         count++;
       }
     }
-    
+
     return positions;
   }
 
   /**
-   * Fisher-Yates 셔플 알고리즘
+   * Fisher-Yates 셔플
    */
   private shuffle<T>(array: T[]): void {
     for (let i = array.length - 1; i > 0; i--) {

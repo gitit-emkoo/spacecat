@@ -1,179 +1,502 @@
 /**
- * App.tsx - 메인 앱 컴포넌트
- * 
- * 3D Color Chain Bolt Merge 게임의 진입점
- * GameManager를 통해 게임 상태를 관리하고,
- * 3D 씬과 UI를 통합합니다.
+ * App.tsx - 3D Color Chain Bolt Merge + 함교 허브 / 구역별 항로 조우
  */
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import confetti from 'canvas-confetti';
 import { GameScene } from './components/GameScene';
 import { MergeSlotsUI } from './components/MergeSlotsUI';
+import { StoryHud } from './components/StoryHud';
+import { StoryModal } from './components/StoryModal';
+import { CollectionPanel } from './components/CollectionPanel';
+import { ShipLobby } from './components/ShipLobby';
+import { RepairMapPanel } from './components/RepairMapPanel';
+import { ShipStatusPanel } from './components/ShipStatusPanel';
+import { SettingsPanel } from './components/SettingsPanel';
+import { TutorialPanel } from './components/TutorialPanel';
+import { ZoneBriefingPanel } from './components/ZoneBriefingPanel';
 import { GameManager } from './game/GameManager';
-import { BoltData, BoltColor, GameState } from './game/types';
+import { BoltData, BoltColor, GameState, DEFAULT_CONFIG } from './game/types';
 import { soundManager } from './game/SoundManager';
+import {
+  PLAYER_SHIP,
+  LEVELS_PER_ZONE,
+  PlayContext,
+  RepairZone,
+  RepairZoneId,
+  ShipEncounter,
+  CampaignProgress,
+  clearCampaignProgress,
+  createDefaultProgress,
+  getEncounterForZone,
+  getRouteForZone,
+  getZoneAtmosphere,
+  getZoneById,
+  isHomeShipComplete,
+  loadCampaignProgress,
+  resolveLobbySnapshot,
+  resolveProgressFromContext,
+  saveCampaignProgress,
+} from './story/campaign';
+
+type StoryPhase =
+  | 'intro'
+  | 'lobby'
+  | 'repairMap'
+  | 'status'
+  | 'settings'
+  | 'tutorial'
+  | 'zoneBriefing'
+  | 'playing'
+  | 'zoneClear'
+  | 'shipClear'
+  | 'sortieIntro'
+  | 'homeComplete'
+  | 'collection';
+
+function difficultyForLevel(level: number) {
+  const boltCount = Math.min(DEFAULT_CONFIG.totalBolts + (level - 1) * 6, 60);
+  const colorCount = Math.min(DEFAULT_CONFIG.colorCount + Math.floor((level - 1) / 3), 6);
+  return { boltCount, colorCount };
+}
 
 function App() {
-  const gameManagerRef = useRef<GameManager>(new GameManager(7));
+  const gameManagerRef = useRef<GameManager>(new GameManager(DEFAULT_CONFIG.maxSlots));
   const [bolts, setBolts] = useState<BoltData[]>([]);
   const [mergeSlots, setMergeSlots] = useState<BoltColor[]>([]);
   const [gameState, setGameState] = useState<GameState>(GameState.Playing);
   const [remainingCount, setRemainingCount] = useState(0);
+  const [maxSlots, setMaxSlots] = useState(DEFAULT_CONFIG.maxSlots);
   const [showMergeEffect, setShowMergeEffect] = useState(false);
-  const [level, setLevel] = useState(1);
-  const [score, setScore] = useState(0);
   const [combo, setCombo] = useState(0);
   const [shakeBoard, setShakeBoard] = useState(false);
 
-  // 상태 업데이트 함수
+  const [storyPhase, setStoryPhase] = useState<StoryPhase>('intro');
+  const [progressState, setProgressState] = useState<CampaignProgress>(() => loadCampaignProgress());
+  const [clearedZone, setClearedZone] = useState<RepairZone | null>(null);
+  const [clearedEncounter, setClearedEncounter] = useState<ShipEncounter | null>(null);
+  const [pendingSortie, setPendingSortie] = useState<ShipEncounter | null>(null);
+  const [pendingSortieZoneId, setPendingSortieZoneId] = useState<RepairZoneId | null>(null);
+  const [returnPhase, setReturnPhase] = useState<StoryPhase>('lobby');
+
+  const {
+    homeZoneLevels,
+    playContext,
+    globalLevel,
+    score,
+    collectedIds,
+    soundEnabled,
+    seenTutorial,
+    seenHomeComplete,
+  } = progressState;
+
+  const patchProgress = useCallback((partial: Partial<CampaignProgress>) => {
+    setProgressState((prev) => {
+      const next = { ...prev, ...partial };
+      saveCampaignProgress(next);
+      return next;
+    });
+  }, []);
+
+  const progress = useMemo(() => {
+    if (playContext) {
+      return resolveProgressFromContext(playContext, homeZoneLevels);
+    }
+    return resolveLobbySnapshot(homeZoneLevels);
+  }, [playContext, homeZoneLevels]);
+
+  const encounter = progress.encounter;
+
   const updateState = useCallback(() => {
     const gm = gameManagerRef.current;
     setBolts([...gm.getBoardBolts()]);
     setMergeSlots([...gm.getMergeSlots()]);
     setGameState(gm.getGameState());
     setRemainingCount(gm.getRemainingBoltCount());
+    setMaxSlots(gm.getMaxSlots());
   }, []);
 
-  // 게임 초기화
+  const startPuzzleLevel = useCallback(
+    (level: number) => {
+      const { boltCount, colorCount } = difficultyForLevel(level);
+      const gm = gameManagerRef.current;
+      gm.generateNewLevel(boltCount, colorCount);
+      setCombo(0);
+      updateState();
+    },
+    [updateState]
+  );
+
   useEffect(() => {
     const gm = gameManagerRef.current;
     gm.setOnStateChange(updateState);
-    gm.generateNewLevel(36, 4);
-    updateState();
-  }, [updateState]);
+    soundManager.setMuted(!progressState.soundEnabled);
+  }, [updateState, progressState.soundEnabled]);
 
-  // 머지 효과 감지
+  // 머지 이펙트
   const prevSlotsLength = useRef(mergeSlots.length);
   useEffect(() => {
     if (mergeSlots.length < prevSlotsLength.current) {
       setShowMergeEffect(true);
-      setCombo(prev => prev + 1);
-      const comboBonus = combo * 50;
-      setScore(prev => prev + 100 + comboBonus);
+      setCombo((prev) => prev + 1);
+      setProgressState((prev) => {
+        const next = {
+          ...prev,
+          score: prev.score + 100 + combo * 50,
+        };
+        saveCampaignProgress(next);
+        return next;
+      });
       soundManager.playMerge();
+      confetti({
+        particleCount: 60 + combo * 20,
+        spread: 70,
+        origin: { y: 0.75 },
+        colors: ['#ef4444', '#3b82f6', '#22c55e', '#eab308', '#a855f7'],
+      });
       setTimeout(() => setShowMergeEffect(false), 600);
     } else if (mergeSlots.length > prevSlotsLength.current) {
-      // 새 볼트가 추가되면 콤보 리셋
       setCombo(0);
     }
     prevSlotsLength.current = mergeSlots.length;
   }, [mergeSlots, combo]);
 
-  // 게임 상태 변화에 따른 효과음
   useEffect(() => {
-    if (gameState === GameState.Win) {
+    if (gameState === GameState.Win && storyPhase === 'playing') {
       soundManager.playWin();
-    } else if (gameState === GameState.Lose) {
+    } else if (gameState === GameState.Lose && storyPhase === 'playing') {
       soundManager.playGameOver();
       setShakeBoard(true);
       setTimeout(() => setShakeBoard(false), 500);
     }
-  }, [gameState]);
+  }, [gameState, storyPhase]);
 
-  // 볼트 클릭 핸들러
-  const handleBoltClick = useCallback((boltId: number) => {
-    const gm = gameManagerRef.current;
-    
-    if (gm.isBoltLocked(boltId)) {
-      soundManager.playLocked();
-      return;
+  const enterLobby = useCallback(() => {
+    if (!seenTutorial) {
+      setStoryPhase('tutorial');
+    } else if (isHomeShipComplete(homeZoneLevels) && !seenHomeComplete) {
+      setStoryPhase('homeComplete');
+    } else {
+      setStoryPhase('lobby');
     }
-    
-    const success = gm.onBoltClicked(boltId);
-    if (success) {
-      soundManager.playBoltClick();
-    }
+  }, [seenTutorial, seenHomeComplete, homeZoneLevels]);
+
+  const beginPlay = useCallback(
+    (ctx: PlayContext, opts?: { skipBriefing?: boolean }) => {
+      patchProgress({ playContext: ctx });
+      if (!opts?.skipBriefing && ctx.kind === 'home') {
+        setStoryPhase('zoneBriefing');
+        return;
+      }
+      startPuzzleLevel(globalLevel);
+      setStoryPhase('playing');
+    },
+    [patchProgress, startPuzzleLevel, globalLevel]
+  );
+
+  const confirmZoneBriefing = useCallback(() => {
+    startPuzzleLevel(globalLevel);
+    setStoryPhase('playing');
+  }, [startPuzzleLevel, globalLevel]);
+
+  const handleSelectZone = useCallback(
+    (zoneId: RepairZoneId) => {
+      const completed = homeZoneLevels[zoneId];
+      if (completed >= LEVELS_PER_ZONE) return;
+      const levelInZone = Math.min(completed + 1, LEVELS_PER_ZONE);
+      beginPlay({ kind: 'home', zoneId, levelInZone });
+    },
+    [homeZoneLevels, beginPlay]
+  );
+
+  const openSortieIntro = useCallback((zoneId: RepairZoneId) => {
+    const ship = getEncounterForZone(zoneId);
+    setPendingSortie(ship);
+    setPendingSortieZoneId(zoneId);
+    setClearedZone(getZoneById(zoneId));
+    setStoryPhase('sortieIntro');
   }, []);
 
-  // 잠금 확인
+  const handleLaunchSortie = useCallback(
+    (zoneId: RepairZoneId) => {
+      openSortieIntro(zoneId);
+    },
+    [openSortieIntro]
+  );
+
+  const handleContinueRepair = useCallback(() => {
+    if (playContext) {
+      beginPlay(playContext, { skipBriefing: true });
+      return;
+    }
+    setStoryPhase('repairMap');
+  }, [playContext, beginPlay]);
+
+  const startSortiePlay = useCallback(() => {
+    if (!pendingSortie) return;
+    const ctx: PlayContext = {
+      kind: 'sortie',
+      encounterId: pendingSortie.id,
+      levelInZone: 1,
+    };
+    setPendingSortie(null);
+    beginPlay(ctx, { skipBriefing: true });
+  }, [pendingSortie, beginPlay]);
+
+  const handleBoltClick = useCallback(
+    (boltId: number) => {
+      if (storyPhase !== 'playing') return;
+      const gm = gameManagerRef.current;
+      if (gm.isBoltLocked(boltId)) {
+        soundManager.playLocked();
+        return;
+      }
+      if (gm.onBoltClicked(boltId)) {
+        soundManager.playBoltClick();
+      }
+    },
+    [storyPhase]
+  );
+
   const isBoltLocked = useCallback((boltId: number) => {
     return gameManagerRef.current.isBoltLocked(boltId);
   }, []);
 
-  // 클릭 가능 확인
-  const isBoltClickable = useCallback((boltId: number) => {
-    return gameManagerRef.current.isBoltClickable(boltId);
+  const isBoltClickable = useCallback(
+    (boltId: number) => {
+      if (storyPhase !== 'playing') return false;
+      return gameManagerRef.current.isBoltClickable(boltId);
+    },
+    [storyPhase]
+  );
+
+  /** 퍼즐 클리어 후 캠페인 진행 */
+  const advanceCampaign = useCallback(() => {
+    if (!playContext) {
+      setStoryPhase('lobby');
+      return;
+    }
+
+    const nextGlobal = globalLevel + 1;
+
+    if (playContext.kind === 'home') {
+      const { zoneId, levelInZone } = playContext;
+      const nextHomeLevels = {
+        ...homeZoneLevels,
+        [zoneId]: Math.max(homeZoneLevels[zoneId], levelInZone),
+      };
+
+      if (levelInZone >= LEVELS_PER_ZONE) {
+        patchProgress({
+          homeZoneLevels: nextHomeLevels,
+          globalLevel: nextGlobal,
+          playContext: null,
+        });
+        setClearedZone(getZoneById(zoneId));
+        setPendingSortie(getEncounterForZone(zoneId));
+        setPendingSortieZoneId(zoneId);
+        setStoryPhase('zoneClear');
+        confetti({ particleCount: 80, spread: 80, origin: { y: 0.55 } });
+        return;
+      }
+
+      const nextCtx: PlayContext = {
+        kind: 'home',
+        zoneId,
+        levelInZone: levelInZone + 1,
+      };
+      patchProgress({
+        homeZoneLevels: nextHomeLevels,
+        globalLevel: nextGlobal,
+        playContext: nextCtx,
+      });
+      startPuzzleLevel(nextGlobal);
+      setStoryPhase('playing');
+      return;
+    }
+
+    // sortie
+    const { encounterId, levelInZone } = playContext;
+    if (levelInZone >= LEVELS_PER_ZONE) {
+      const nextIds = collectedIds.includes(encounterId)
+        ? collectedIds
+        : [...collectedIds, encounterId];
+      let withHome = nextIds;
+      if (isHomeShipComplete(homeZoneLevels) && !nextIds.includes(PLAYER_SHIP.id)) {
+        withHome = [...nextIds, PLAYER_SHIP.id];
+      }
+      const finishedShip = progress.encounter;
+      patchProgress({
+        globalLevel: nextGlobal,
+        playContext: null,
+        collectedIds: withHome,
+      });
+      setClearedEncounter(finishedShip);
+      setClearedZone(null);
+      setStoryPhase('shipClear');
+      confetti({ particleCount: 120, spread: 100, origin: { y: 0.55 } });
+      return;
+    }
+
+    const nextCtx: PlayContext = {
+      kind: 'sortie',
+      encounterId,
+      levelInZone: levelInZone + 1,
+    };
+    patchProgress({
+      globalLevel: nextGlobal,
+      playContext: nextCtx,
+    });
+    startPuzzleLevel(nextGlobal);
+    setStoryPhase('playing');
+  }, [
+    playContext,
+    progress.encounter,
+    globalLevel,
+    homeZoneLevels,
+    collectedIds,
+    patchProgress,
+    startPuzzleLevel,
+  ]);
+
+  const continueAfterZoneClear = useCallback(() => {
+    if (pendingSortieZoneId) {
+      setStoryPhase('sortieIntro');
+      return;
+    }
+    setClearedZone(null);
+    setStoryPhase('lobby');
+  }, [pendingSortieZoneId]);
+
+  const continueAfterShipClear = useCallback(() => {
+    setPendingSortie(null);
+    setPendingSortieZoneId(null);
+    setClearedZone(null);
+    if (isHomeShipComplete(homeZoneLevels) && !seenHomeComplete) {
+      setStoryPhase('homeComplete');
+      return;
+    }
+    setStoryPhase('lobby');
+  }, [homeZoneLevels, seenHomeComplete]);
+
+  const handleRetryLevel = useCallback(() => {
+    startPuzzleLevel(globalLevel);
+    setStoryPhase('playing');
+  }, [globalLevel, startPuzzleLevel]);
+
+  const handleReturnToLobby = useCallback(() => {
+    setStoryPhase('lobby');
   }, []);
 
-  // 새 게임 시작
-  const handleNewGame = useCallback(() => {
-    const gm = gameManagerRef.current;
-    const newLevel = level + 1;
-    const boltCount = Math.min(36 + (newLevel - 1) * 6, 60);
-    const colorCount = Math.min(4 + Math.floor((newLevel - 1) / 3), 6);
-    gm.generateNewLevel(boltCount, colorCount);
-    setLevel(newLevel);
-    setCombo(0);
-    updateState();
-  }, [level, updateState]);
-
-  // 리셋
   const handleReset = useCallback(() => {
-    const gm = gameManagerRef.current;
-    gm.generateNewLevel(36, 4);
-    setLevel(1);
-    setScore(0);
+    clearCampaignProgress();
+    const fresh = createDefaultProgress();
+    setProgressState(fresh);
+    soundManager.setMuted(false);
+    setClearedZone(null);
+    setPendingSortie(null);
+    setPendingSortieZoneId(null);
     setCombo(0);
-    updateState();
-  }, [updateState]);
+    setStoryPhase('intro');
+  }, []);
+
+  const handleToggleSound = useCallback(
+    (enabled: boolean) => {
+      soundManager.setMuted(!enabled);
+      patchProgress({ soundEnabled: enabled });
+    },
+    [patchProgress]
+  );
+
+  const handleCloseTutorial = useCallback(() => {
+    patchProgress({ seenTutorial: true });
+    if (isHomeShipComplete(homeZoneLevels) && !seenHomeComplete) {
+      setStoryPhase('homeComplete');
+    } else {
+      setStoryPhase('lobby');
+    }
+  }, [patchProgress, homeZoneLevels, seenHomeComplete]);
+
+  const handleDismissHomeComplete = useCallback(() => {
+    const ids = collectedIds.includes(PLAYER_SHIP.id)
+      ? collectedIds
+      : [...collectedIds, PLAYER_SHIP.id];
+    patchProgress({ seenHomeComplete: true, collectedIds: ids });
+    setStoryPhase('lobby');
+  }, [patchProgress, collectedIds]);
+
+  const openCollection = useCallback(() => {
+    setReturnPhase(storyPhase === 'playing' ? 'playing' : 'lobby');
+    setStoryPhase('collection');
+  }, [storyPhase]);
+
+  const inLobbyHub =
+    storyPhase === 'lobby' ||
+    storyPhase === 'repairMap' ||
+    storyPhase === 'status' ||
+    storyPhase === 'settings' ||
+    storyPhase === 'tutorial' ||
+    storyPhase === 'homeComplete';
+
+  const showPuzzleChrome =
+    storyPhase === 'playing' ||
+    storyPhase === 'zoneClear' ||
+    storyPhase === 'shipClear' ||
+    storyPhase === 'sortieIntro';
+
+  const overlayBlocksTips =
+    storyPhase !== 'playing' || gameState !== GameState.Playing;
+
+  const activeAtmosphere = getZoneAtmosphere(progress.zone.id);
 
   return (
-    <div className={`w-screen h-screen bg-gray-950 overflow-hidden relative ${shakeBoard ? 'animate-shake' : ''}`}>
-      {/* 3D 게임 씬 */}
-      <div className="absolute inset-0">
-        <GameScene
-          bolts={bolts}
-          onBoltClick={handleBoltClick}
-          isBoltLocked={isBoltLocked}
-          isBoltClickable={isBoltClickable}
-        />
-      </div>
-
-      {/* 상단 UI */}
-      <div className="absolute top-0 left-0 right-0 z-40 p-4">
-        <div className="flex items-center justify-between max-w-5xl mx-auto">
-          {/* 제목 및 레벨 */}
-          <div className="flex items-center gap-3">
-            <h1 className="text-xl md:text-2xl font-bold text-white tracking-tight flex items-center gap-2">
-              <span className="text-2xl">⚙️</span>
-              <span className="hidden sm:inline bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent">
-                Bolt Merge
-              </span>
-            </h1>
-            <div className="bg-gray-800/80 backdrop-blur-sm rounded-lg px-3 py-1.5 border border-gray-700">
-              <span className="text-gray-400 text-xs">Lv.</span>
-              <span className="text-white font-bold ml-1">{level}</span>
-            </div>
-          </div>
-
-          {/* 점수 및 정보 */}
-          <div className="flex items-center gap-2">
-            {combo > 0 && (
-              <div className="bg-purple-900/80 backdrop-blur-sm rounded-lg px-3 py-1.5 border border-purple-600 animate-pulse">
-                <span className="text-purple-300 text-xs">콤보 </span>
-                <span className="text-purple-200 font-bold">x{combo}</span>
-              </div>
-            )}
-            <div className="bg-gray-800/80 backdrop-blur-sm rounded-lg px-3 py-1.5 border border-gray-700">
-              <span className="text-gray-400 text-xs">점수 </span>
-              <span className="text-yellow-400 font-bold">{score}</span>
-            </div>
-            <div className="bg-gray-800/80 backdrop-blur-sm rounded-lg px-3 py-1.5 border border-gray-700">
-              <span className="text-gray-400 text-xs">남은 </span>
-              <span className="text-green-400 font-bold">{remainingCount}</span>
-            </div>
-            <button
-              onClick={handleReset}
-              className="bg-gray-800/80 backdrop-blur-sm rounded-lg px-3 py-1.5 border border-gray-700 text-gray-400 hover:text-white hover:border-gray-500 transition-all text-xs"
-            >
-              🔄 리셋
-            </button>
-          </div>
+    <div
+      className={`w-screen h-screen bg-gray-950 overflow-hidden relative ${
+        shakeBoard ? 'animate-shake' : ''
+      }`}
+    >
+      {/* 퍼즐 씬: 플레이/관련 오버레이에서만 표시, 함교·브리핑에서는 숨김 */}
+      {!inLobbyHub &&
+        storyPhase !== 'intro' &&
+        storyPhase !== 'collection' &&
+        storyPhase !== 'zoneBriefing' && (
+        <div className="absolute inset-0">
+          <GameScene
+            bolts={bolts}
+            onBoltClick={handleBoltClick}
+            isBoltLocked={isBoltLocked}
+            isBoltClickable={isBoltClickable}
+            atmosphere={activeAtmosphere}
+          />
         </div>
-      </div>
+      )}
 
-      {/* 머지 이펙트 */}
-      {showMergeEffect && (
+      {/* intro / collection 배경용 은은한 씬 */}
+      {(storyPhase === 'intro' || storyPhase === 'collection') && (
+        <div className="absolute inset-0 bg-slate-950">
+          <div
+            className="absolute inset-0 opacity-40"
+            style={{
+              backgroundImage:
+                'radial-gradient(circle at 30% 40%, rgba(56,189,248,0.3), transparent 45%), radial-gradient(circle at 70% 60%, rgba(167,139,250,0.25), transparent 40%)',
+            }}
+          />
+        </div>
+      )}
+
+      {showPuzzleChrome && (
+        <StoryHud
+          progress={progress}
+          score={score}
+          remainingCount={remainingCount}
+          combo={combo}
+          onOpenCollection={openCollection}
+          onReturnToLobby={handleReturnToLobby}
+          onReset={handleReset}
+        />
+      )}
+
+      {showMergeEffect && storyPhase === 'playing' && (
         <div className="absolute inset-0 flex items-center justify-center z-30 pointer-events-none">
           <div className="relative">
             <div className="text-5xl md:text-7xl font-black text-transparent bg-clip-text bg-gradient-to-r from-yellow-400 via-pink-400 to-purple-400 animate-bounce">
@@ -188,62 +511,51 @@ function App() {
         </div>
       )}
 
-      {/* 하단 머지 슬롯 */}
-      <MergeSlotsUI slots={mergeSlots} maxSlots={7} />
+      {storyPhase === 'playing' && <MergeSlotsUI slots={mergeSlots} maxSlots={maxSlots} />}
 
-      {/* 게임 오버 / 승리 오버레이 */}
-      {gameState !== GameState.Playing && (
+      {storyPhase === 'playing' && gameState !== GameState.Playing && (
         <div className="absolute inset-0 flex items-center justify-center z-50 bg-black/70 backdrop-blur-sm">
-          <div className="text-center p-8 bg-gray-900/95 rounded-3xl border border-gray-700 shadow-2xl max-w-md mx-4 transform animate-[fadeIn_0.3s_ease-out]">
+          <div className="text-center p-8 bg-gray-900/95 rounded-3xl border border-gray-700 shadow-2xl max-w-md mx-4 animate-[fadeIn_0.3s_ease-out]">
             {gameState === GameState.Win ? (
               <>
-                <div className="text-6xl mb-4 animate-bounce">🎉</div>
-                <h2 className="text-3xl font-bold text-green-400 mb-2">클리어!</h2>
-                <p className="text-gray-400 mb-4">모든 볼트를 성공적으로 풀었습니다!</p>
-                <div className="flex justify-center gap-4 mb-6">
-                  <div className="bg-gray-800 rounded-lg px-4 py-2">
-                    <div className="text-yellow-400 font-bold text-xl">{score}</div>
-                    <div className="text-gray-500 text-xs">점수</div>
-                  </div>
-                  <div className="bg-gray-800 rounded-lg px-4 py-2">
-                    <div className="text-blue-400 font-bold text-xl">{level}</div>
-                    <div className="text-gray-500 text-xs">레벨</div>
-                  </div>
-                </div>
+                <img
+                  src="/characters/cat-astronaut-avatar.jpg"
+                  alt="캡틴 냥이"
+                  className="w-20 h-20 rounded-2xl object-cover mx-auto mb-4 border border-sky-400"
+                />
+                <h2 className="text-3xl font-bold text-green-400 mb-2">나사 정리 완료!</h2>
+                <p className="text-gray-400 mb-2">
+                  {encounter.nameKo} · {progress.zone.nameKo} {progress.levelInZone}/
+                  {progress.levelsRequired}
+                </p>
+                <p className="text-sky-300/90 text-sm mb-6">“좋아, 한 칸 더 고쳤어!”</p>
                 <button
-                  onClick={handleNewGame}
-                  className="px-8 py-3 bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 text-white font-bold rounded-xl transition-all duration-200 hover:scale-105 shadow-lg shadow-blue-500/20"
+                  type="button"
+                  onClick={advanceCampaign}
+                  className="px-8 py-3 bg-sky-400 hover:bg-sky-300 text-slate-950 font-bold rounded-xl transition hover:scale-105"
                 >
-                  다음 레벨 도전 →
+                  계속 수리 →
                 </button>
               </>
             ) : (
               <>
                 <div className="text-6xl mb-4">💥</div>
-                <h2 className="text-3xl font-bold text-red-400 mb-2">게임 오버</h2>
-                <p className="text-gray-400 mb-4">머지 슬롯이 가득 찼습니다!</p>
-                <div className="flex justify-center gap-4 mb-6">
-                  <div className="bg-gray-800 rounded-lg px-4 py-2">
-                    <div className="text-yellow-400 font-bold text-xl">{score}</div>
-                    <div className="text-gray-500 text-xs">점수</div>
-                  </div>
-                  <div className="bg-gray-800 rounded-lg px-4 py-2">
-                    <div className="text-blue-400 font-bold text-xl">{level}</div>
-                    <div className="text-gray-500 text-xs">레벨</div>
-                  </div>
-                </div>
+                <h2 className="text-3xl font-bold text-red-400 mb-2">수리 중단</h2>
+                <p className="text-gray-400 mb-6">머지 슬롯이 가득 찼습니다!</p>
                 <div className="flex gap-3 justify-center">
                   <button
-                    onClick={handleReset}
-                    className="px-6 py-3 bg-gray-700 hover:bg-gray-600 text-white font-bold rounded-xl transition-all duration-200 hover:scale-105"
+                    type="button"
+                    onClick={handleReturnToLobby}
+                    className="px-6 py-3 bg-gray-700 hover:bg-gray-600 text-white font-bold rounded-xl"
                   >
-                    처음부터
+                    함교로
                   </button>
                   <button
-                    onClick={handleNewGame}
-                    className="px-6 py-3 bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 text-white font-bold rounded-xl transition-all duration-200 hover:scale-105 shadow-lg shadow-blue-500/20"
+                    type="button"
+                    onClick={handleRetryLevel}
+                    className="px-6 py-3 bg-sky-400 hover:bg-sky-300 text-slate-950 font-bold rounded-xl"
                   >
-                    계속하기
+                    재시도
                   </button>
                 </div>
               </>
@@ -252,16 +564,145 @@ function App() {
         </div>
       )}
 
-      {/* 조작 가이드 */}
-      <div className="absolute bottom-28 left-4 z-40 hidden md:block">
-        <div className="bg-gray-900/80 backdrop-blur-sm rounded-lg p-3 border border-gray-800 text-xs text-gray-500 space-y-1">
-          <p>🖱️ <span className="text-gray-400">클릭</span>: 볼트 선택</p>
-          <p>🔄 <span className="text-gray-400">드래그</span>: 카메라 회전</p>
-          <p>🔍 <span className="text-gray-400">스크롤</span>: 줌 인/아웃</p>
-          <p className="pt-1 border-t border-gray-800">🔒 <span className="text-gray-400">어두운 볼트</span>: 잠김 (먼저 해제 필요)</p>
-          <p>✨ <span className="text-gray-400">같은 색 3개</span>: 자동 머지!</p>
+      {storyPhase === 'intro' && (
+        <StoryModal
+          kind="intro"
+          encounter={PLAYER_SHIP}
+          onContinue={enterLobby}
+        />
+      )}
+
+      {(storyPhase === 'lobby' ||
+        storyPhase === 'repairMap' ||
+        storyPhase === 'status' ||
+        storyPhase === 'settings' ||
+        storyPhase === 'tutorial' ||
+        storyPhase === 'homeComplete') && (
+        <ShipLobby
+          homeZoneLevels={homeZoneLevels}
+          playContext={playContext}
+          collectedIds={collectedIds}
+          showHomeCompleteBanner={false}
+          onContinueRepair={handleContinueRepair}
+          onOpenRepairMap={() => setStoryPhase('repairMap')}
+          onOpenCollection={openCollection}
+          onOpenStatus={() => setStoryPhase('status')}
+          onOpenSettings={() => setStoryPhase('settings')}
+          onOpenTutorial={() => setStoryPhase('tutorial')}
+          onDismissHomeComplete={handleDismissHomeComplete}
+        />
+      )}
+
+      {storyPhase === 'zoneBriefing' && playContext?.kind === 'home' && (
+        <ZoneBriefingPanel
+          zone={getZoneById(playContext.zoneId)}
+          route={getRouteForZone(playContext.zoneId)}
+          atmosphere={getZoneAtmosphere(playContext.zoneId)}
+          levelInZone={playContext.levelInZone}
+          shipNameKo={PLAYER_SHIP.nameKo}
+          onStart={confirmZoneBriefing}
+          onBack={() => {
+            patchProgress({ playContext: null });
+            setStoryPhase('repairMap');
+          }}
+        />
+      )}
+
+      {storyPhase === 'repairMap' && (
+        <RepairMapPanel
+          homeZoneLevels={homeZoneLevels}
+          collectedIds={collectedIds}
+          onSelectZone={handleSelectZone}
+          onLaunchSortie={handleLaunchSortie}
+          onClose={() => setStoryPhase('lobby')}
+        />
+      )}
+
+      {storyPhase === 'status' && (
+        <ShipStatusPanel
+          homeZoneLevels={homeZoneLevels}
+          collectedIds={collectedIds}
+          onClose={() => setStoryPhase('lobby')}
+        />
+      )}
+
+      {storyPhase === 'settings' && (
+        <SettingsPanel
+          soundEnabled={soundEnabled}
+          onToggleSound={handleToggleSound}
+          onClose={() => setStoryPhase('lobby')}
+        />
+      )}
+
+      {storyPhase === 'tutorial' && <TutorialPanel onClose={handleCloseTutorial} />}
+
+      {storyPhase === 'zoneClear' && clearedZone && (
+        <StoryModal
+          kind="zoneClear"
+          encounter={PLAYER_SHIP}
+          zone={clearedZone}
+          route={getRouteForZone(clearedZone.id)}
+          nextEncounter={pendingSortie ?? undefined}
+          isHomeZoneClear
+          onContinue={continueAfterZoneClear}
+        />
+      )}
+
+      {storyPhase === 'sortieIntro' && pendingSortie && pendingSortieZoneId && (
+        <StoryModal
+          kind="sortieIntro"
+          encounter={PLAYER_SHIP}
+          zone={getZoneById(pendingSortieZoneId)}
+          nextEncounter={pendingSortie}
+          route={getRouteForZone(pendingSortieZoneId)}
+          onContinue={startSortiePlay}
+        />
+      )}
+
+      {storyPhase === 'shipClear' && (
+        <StoryModal
+          kind="shipClear"
+          encounter={clearedEncounter ?? encounter}
+          onContinue={continueAfterShipClear}
+        />
+      )}
+
+      {storyPhase === 'homeComplete' && (
+        <StoryModal
+          kind="homeComplete"
+          encounter={PLAYER_SHIP}
+          onContinue={handleDismissHomeComplete}
+        />
+      )}
+
+      {storyPhase === 'collection' && (
+        <CollectionPanel
+          collectedIds={collectedIds}
+          onClose={() => setStoryPhase(returnPhase === 'playing' && playContext ? 'playing' : 'lobby')}
+        />
+      )}
+
+      {storyPhase === 'playing' && !overlayBlocksTips && (
+        <div className="absolute bottom-28 left-4 z-40 hidden md:block">
+          <div className="bg-gray-900/80 backdrop-blur-sm rounded-lg p-3 border border-gray-800 text-xs text-gray-500 space-y-1 max-w-[220px]">
+            <p className="text-slate-300 font-medium mb-1">캡틴 냥이의 팁</p>
+            <p>
+              클릭: <span className="text-gray-400">풀린 나사 선택</span>
+            </p>
+            <p>
+              같은 색 3개: <span className="text-gray-400">자동 머지</span>
+            </p>
+            <p>
+              구역 {LEVELS_PER_ZONE}레벨: <span className="text-gray-400">항로 개방</span>
+            </p>
+            {progress.route && (
+              <p className="pt-1 border-t border-gray-800 text-slate-500">
+                {progress.route.headingKo} 항로 → 조우 대기
+              </p>
+            )}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

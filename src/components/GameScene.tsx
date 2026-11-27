@@ -1,8 +1,7 @@
 /**
  * GameScene - 3D 게임 씬 컴포넌트
- * 
- * Three.js 기반 3D 씬을 렌더링합니다.
- * 볼트, 체인, 조명, 카메라 등을 포함합니다.
+ *
+ * 구역 분위기에 따라 배경·조명·플랫폼 색이 달라집니다.
  */
 
 import { useRef } from 'react';
@@ -11,32 +10,38 @@ import { OrbitControls, Environment, Grid, Float } from '@react-three/drei';
 import { Mesh, Group } from 'three';
 import { Bolt3D } from './Bolt3D';
 import { ChainLink } from './ChainLink';
+import { CatAstronaut3D } from './characters/CatAstronaut3D';
+import { PatrolFlight } from './characters/PatrolFlight';
 import { BoltData } from '../game/types';
+import { ZoneAtmosphere, ZONE_ATMOSPHERES } from '../story/campaign';
 
 interface GameSceneProps {
   bolts: BoltData[];
   onBoltClick: (id: number) => void;
   isBoltLocked: (id: number) => boolean;
   isBoltClickable: (id: number) => boolean;
+  atmosphere?: ZoneAtmosphere;
 }
 
+const DEFAULT_ATMO = ZONE_ATMOSPHERES.tail;
+
 /** 회전하는 장식 링 */
-function DecorativeRing() {
+function DecorativeRing({ color }: { color: string }) {
   const ringRef = useRef<Mesh>(null);
-  
+
   useFrame((state) => {
     if (ringRef.current) {
       ringRef.current.rotation.y = state.clock.elapsedTime * 0.1;
       ringRef.current.rotation.x = Math.sin(state.clock.elapsedTime * 0.2) * 0.1;
     }
   });
-  
+
   return (
     <mesh ref={ringRef} position={[0, -0.1, 0]} rotation={[-Math.PI / 2, 0, 0]}>
       <torusGeometry args={[7, 0.03, 8, 64]} />
       <meshStandardMaterial
-        color="#4f46e5"
-        emissive="#4f46e5"
+        color={color}
+        emissive={color}
         emissiveIntensity={0.5}
         metalness={1}
         roughness={0}
@@ -48,29 +53,29 @@ function DecorativeRing() {
 }
 
 /** 떠다니는 입자 장식 */
-function FloatingOrbs() {
+function FloatingOrbs({ colors }: { colors: string[] }) {
   const groupRef = useRef<Group>(null);
-  
+
   useFrame((state) => {
     if (groupRef.current) {
       groupRef.current.rotation.y = state.clock.elapsedTime * 0.05;
     }
   });
-  
+
   const orbs = Array.from({ length: 8 }, (_, i) => {
     const angle = (i / 8) * Math.PI * 2;
-    const radius = 6 + Math.random() * 2;
+    const radius = 6 + (i % 3) * 0.7;
     return {
       position: [
         Math.cos(angle) * radius,
         1 + Math.sin(i * 1.5) * 2,
         Math.sin(angle) * radius,
       ] as [number, number, number],
-      color: ['#ef4444', '#3b82f6', '#22c55e', '#eab308', '#a855f7', '#f97316', '#06b6d4', '#ec4899'][i],
-      scale: 0.05 + Math.random() * 0.08,
+      color: colors[i % colors.length],
+      scale: 0.05 + (i % 4) * 0.02,
     };
   });
-  
+
   return (
     <group ref={groupRef}>
       {orbs.map((orb, i) => (
@@ -92,25 +97,25 @@ function FloatingOrbs() {
 }
 
 /** 게임 보드 플랫폼 */
-function BoardPlatform() {
+function BoardPlatform({
+  platformColor,
+  rimColor,
+}: {
+  platformColor: string;
+  rimColor: string;
+}) {
   return (
     <group>
-      {/* 메인 플랫폼 */}
       <mesh position={[0, -0.35, 0]} receiveShadow>
         <cylinderGeometry args={[6, 6.5, 0.15, 32]} />
-        <meshStandardMaterial
-          color="#1e1b4b"
-          metalness={0.5}
-          roughness={0.3}
-        />
+        <meshStandardMaterial color={platformColor} metalness={0.5} roughness={0.3} />
       </mesh>
-      
-      {/* 플랫폼 테두리 */}
+
       <mesh position={[0, -0.28, 0]}>
         <torusGeometry args={[6.2, 0.05, 8, 64]} />
         <meshStandardMaterial
-          color="#6366f1"
-          emissive="#6366f1"
+          color={rimColor}
+          emissive={rimColor}
           emissiveIntensity={0.8}
           metalness={1}
           roughness={0}
@@ -120,12 +125,17 @@ function BoardPlatform() {
   );
 }
 
-export function GameScene({ bolts, onBoltClick, isBoltLocked, isBoltClickable }: GameSceneProps) {
-  // 체인 연결이 필요한 볼트 쌍
+export function GameScene({
+  bolts,
+  onBoltClick,
+  isBoltLocked,
+  isBoltClickable,
+  atmosphere = DEFAULT_ATMO,
+}: GameSceneProps) {
   const chainPairs = bolts
-    .filter(b => !b.isRemoved && b.lockedByBoltId !== -1)
-    .map(bolt => {
-      const locker = bolts.find(b => b.id === bolt.lockedByBoltId);
+    .filter((b) => !b.isRemoved && b.lockedByBoltId !== -1)
+    .map((bolt) => {
+      const locker = bolts.find((b) => b.id === bolt.lockedByBoltId);
       if (locker && !locker.isRemoved) {
         return { fromBolt: bolt, toBolt: locker };
       }
@@ -133,22 +143,30 @@ export function GameScene({ bolts, onBoltClick, isBoltLocked, isBoltClickable }:
     })
     .filter(Boolean) as { fromBolt: BoltData; toBolt: BoltData }[];
 
+  const orbColors = [
+    atmosphere.keyLightColor,
+    atmosphere.fillLightColor,
+    atmosphere.accentLightColor,
+    atmosphere.rimColor,
+    atmosphere.uiAccent,
+  ];
+
   return (
     <Canvas
+      key={atmosphere.zoneId}
       shadows
       camera={{ position: [0, 10, 9], fov: 50 }}
       className="w-full h-full"
       gl={{ antialias: true, alpha: false }}
     >
-      {/* 배경 색상 */}
-      <color attach="background" args={['#0a0a1a']} />
-      <fog attach="fog" args={['#0a0a1a', 15, 30]} />
-      
-      {/* 조명 설정 */}
-      <ambientLight intensity={0.3} />
+      <color attach="background" args={[atmosphere.background]} />
+      <fog attach="fog" args={[atmosphere.fog, 15, 30]} />
+
+      <ambientLight intensity={atmosphere.ambientIntensity} />
       <directionalLight
         position={[5, 10, 5]}
-        intensity={1.2}
+        intensity={1.15}
+        color={atmosphere.keyLightColor}
         castShadow
         shadow-mapSize-width={2048}
         shadow-mapSize-height={2048}
@@ -158,35 +176,38 @@ export function GameScene({ bolts, onBoltClick, isBoltLocked, isBoltClickable }:
         shadow-camera-top={10}
         shadow-camera-bottom={-10}
       />
-      <pointLight position={[-5, 5, -5]} intensity={0.5} color="#4488ff" />
-      <pointLight position={[5, 3, 5]} intensity={0.3} color="#ff8844" />
-      <pointLight position={[0, 8, 0]} intensity={0.4} color="#a855f7" />
-      
-      {/* 보드 플랫폼 */}
-      <BoardPlatform />
-      
-      {/* 장식 링 */}
-      <DecorativeRing />
-      
-      {/* 떠다니는 오브 */}
-      <FloatingOrbs />
-      
-      {/* 그리드 */}
+      <pointLight position={[-5, 5, -5]} intensity={0.55} color={atmosphere.fillLightColor} />
+      <pointLight position={[5, 3, 5]} intensity={0.35} color={atmosphere.accentLightColor} />
+      <pointLight position={[0, 8, 0]} intensity={0.4} color={atmosphere.rimColor} />
+
+      <BoardPlatform platformColor={atmosphere.platformColor} rimColor={atmosphere.rimColor} />
+
+      <PatrolFlight radiusX={7.4} radiusZ={6.6} altitude={2.2} speed={0.26} scale={0.75} />
+
+      <CatAstronaut3D
+        position={[-4.4, 0.08, 3.4]}
+        rotation={[0, 0.85, 0]}
+        scale={1.35}
+        idle
+      />
+
+      <DecorativeRing color={atmosphere.ringColor} />
+      <FloatingOrbs colors={orbColors} />
+
       <Grid
         position={[0, -0.42, 0]}
         args={[20, 20]}
         cellSize={1}
         cellThickness={0.3}
-        cellColor="#1e1b4b"
+        cellColor={atmosphere.gridCell}
         sectionSize={5}
         sectionThickness={0.8}
-        sectionColor="#312e81"
+        sectionColor={atmosphere.gridSection}
         fadeDistance={18}
         fadeStrength={1.5}
       />
-      
-      {/* 볼트 렌더링 */}
-      {bolts.map(bolt => (
+
+      {bolts.map((bolt) => (
         <Bolt3D
           key={bolt.id}
           bolt={bolt}
@@ -195,8 +216,7 @@ export function GameScene({ bolts, onBoltClick, isBoltLocked, isBoltClickable }:
           onClick={onBoltClick}
         />
       ))}
-      
-      {/* 체인 연결 렌더링 */}
+
       {chainPairs.map((pair, index) => (
         <ChainLink
           key={`chain-${index}`}
@@ -204,8 +224,7 @@ export function GameScene({ bolts, onBoltClick, isBoltLocked, isBoltClickable }:
           toBolt={pair.toBolt}
         />
       ))}
-      
-      {/* 카메라 컨트롤 */}
+
       <OrbitControls
         enablePan={true}
         enableZoom={true}
@@ -216,8 +235,7 @@ export function GameScene({ bolts, onBoltClick, isBoltLocked, isBoltClickable }:
         minPolarAngle={0.3}
         target={[0, 0, 0]}
       />
-      
-      {/* 환경 */}
+
       <Environment preset="night" />
     </Canvas>
   );
